@@ -13,8 +13,6 @@ import {
   Loader2
 } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
-import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
-import { tomorrow } from 'react-syntax-highlighter/dist/esm/styles/prism';
 
 interface Chat {
   id: string;
@@ -393,18 +391,14 @@ const App: React.FC = () => {
                         <ReactMarkdown
                           components={{
                             code: ({ inline, className, children, ...props }) => {
-                              const match = /language-(\w+)/.exec(className || '');
-                              return !inline && match ? (
-                                <SyntaxHighlighter
-                                  style={tomorrow}
-                                  language={match[1]}
-                                  PreTag="div"
-                                  {...props}
-                                >
-                                  {String(children).replace(/\n$/, '')}
-                                </SyntaxHighlighter>
+                              return !inline ? (
+                                <pre className="bg-gray-100 rounded-lg p-3 overflow-x-auto">
+                                  <code className={className} {...props}>
+                                    {children}
+                                  </code>
+                                </pre>
                               ) : (
-                                <code className={className} {...props}>
+                                <code className="bg-gray-100 rounded px-1 py-0.5" {...props}>
                                   {children}
                                 </code>
                               );
