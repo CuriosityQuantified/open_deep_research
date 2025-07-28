@@ -78,6 +78,9 @@ source .venv/bin/activate  # On Windows: .venv\Scripts\activate
 
 # Install Python dependencies
 uv sync
+
+# Or with pip (alternative)
+pip install -r requirements.txt
 ```
 
 #### 4. Configure Environment Variables

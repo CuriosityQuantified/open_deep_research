@@ -73,7 +73,12 @@ source .venv/bin/activate
 
 # Install Python dependencies
 echo -e "${BLUE}Installing Python dependencies...${NC}"
-uv sync
+if command -v uv &> /dev/null; then
+    uv sync
+else
+    echo -e "${YELLOW}UV not available, using pip instead...${NC}"
+    pip install -r requirements.txt
+fi
 
 # Check if .env exists
 if [ ! -f .env ]; then
