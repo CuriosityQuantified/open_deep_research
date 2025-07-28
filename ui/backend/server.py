@@ -12,6 +12,7 @@ from typing import Dict, List, Optional, Any, AsyncGenerator
 from dataclasses import dataclass, asdict
 import sqlite3
 import aiofiles
+from collections import deque
 
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
@@ -21,20 +22,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, StreamingResponse
 
-# AG-UI imports
-from ag_ui.core import (
-    TextMessageStartEvent,
-    TextMessageContentEvent,
-    TextMessageEndEvent,
-    CustomEvent,
-    EventType,
-    AssistantMessage,
-    UserMessage,
-    BaseMessage
-)
-from ag_ui.encoder import EventEncoder
-
+# LangChain imports
 from langchain_core.messages import HumanMessage, AIMessage
+from langchain_core.callbacks import AsyncCallbackHandler
+from langchain_core.outputs import LLMResult
+from langchain_core.agents import AgentAction, AgentFinish
+
 from open_deep_research.deep_researcher import deep_researcher
 from dotenv import load_dotenv
 
@@ -117,12 +110,91 @@ class SessionState:
         self.chat_id: Optional[str] = None
         self.notes: List[str] = []
         self.final_report: str = ""
+        self.accumulated_tokens: deque = deque(maxlen=1000)  # Buffer for streaming
 
 # Store active sessions
 active_sessions: Dict[WebSocket, SessionState] = {}
 
-# Event encoder
-encoder = EventEncoder()
+# Custom callback handler for streaming
+class StreamingCallbackHandler(AsyncCallbackHandler):
+    """Callback handler that streams all LangChain events to WebSocket"""
+    
+    def __init__(self, websocket: WebSocket, session: SessionState):
+        self.websocket = websocket
+        self.session = session
+        self.current_tool = None
+        self.buffer = []
+        
+    async def send_token(self, token: str):
+        """Send a single token to the frontend"""
+        await self.websocket.send_json({
+            "type": "token",
+            "content": token
+        })
+        
+    async def send_message(self, content: str, message_type: str = "info"):
+        """Send a formatted message"""
+        await self.websocket.send_json({
+            "type": "stream",
+            "message_type": message_type,
+            "content": content
+        })
+    
+    async def on_llm_start(self, serialized: Dict[str, Any], prompts: List[str], **kwargs) -> None:
+        """Called when LLM starts"""
+        model_name = serialized.get("name", "Unknown Model")
+        await self.send_message(f"\n🤖 **{model_name}** thinking...\n", "model_start")
+    
+    async def on_llm_new_token(self, token: str, **kwargs) -> None:
+        """Called on each new token from LLM"""
+        await self.send_token(token)
+        self.buffer.append(token)
+    
+    async def on_llm_end(self, response: LLMResult, **kwargs) -> None:
+        """Called when LLM ends"""
+        await self.send_message("\n", "model_end")
+        # Clear buffer
+        self.buffer = []
+    
+    async def on_tool_start(self, serialized: Dict[str, Any], input_str: str, **kwargs) -> None:
+        """Called when tool starts"""
+        tool_name = serialized.get("name", "Unknown Tool")
+        self.current_tool = tool_name
+        await self.send_message(f"\n🔧 **Tool Call: {tool_name}**", "tool_start")
+        await self.send_message(f"```json\n{json.dumps(json.loads(input_str) if isinstance(input_str, str) else input_str, indent=2)}\n```", "tool_input")
+    
+    async def on_tool_end(self, output: str, **kwargs) -> None:
+        """Called when tool ends"""
+        await self.send_message(f"\n📤 **Tool Output ({self.current_tool}):**", "tool_output_header")
+        # Truncate very long outputs
+        if len(output) > 1000:
+            output = output[:1000] + "\n... (truncated)"
+        await self.send_message(f"```\n{output}\n```\n", "tool_output")
+        self.current_tool = None
+    
+    async def on_tool_error(self, error: Exception, **kwargs) -> None:
+        """Called on tool error"""
+        await self.send_message(f"\n❌ **Tool Error ({self.current_tool}):** {str(error)}\n", "tool_error")
+    
+    async def on_agent_action(self, action: AgentAction, **kwargs) -> None:
+        """Called when agent takes an action"""
+        await self.send_message(f"\n🎯 **Agent Action:** {action.tool}", "agent_action")
+        if action.tool_input:
+            await self.send_message(f"Input: `{action.tool_input}`", "agent_input")
+    
+    async def on_agent_finish(self, finish: AgentFinish, **kwargs) -> None:
+        """Called when agent finishes"""
+        await self.send_message("\n✅ **Agent completed research**\n", "agent_finish")
+    
+    async def on_chain_start(self, serialized: Dict[str, Any], inputs: Dict[str, Any], **kwargs) -> None:
+        """Called when chain starts"""
+        chain_name = serialized.get("name", "Chain")
+        if chain_name != "RunnableSequence":  # Skip generic sequences
+            await self.send_message(f"\n🔗 **{chain_name} starting...**\n", "chain_start")
+    
+    async def on_chain_end(self, outputs: Dict[str, Any], **kwargs) -> None:
+        """Called when chain ends"""
+        pass  # Usually too verbose
 
 # Database helper functions
 def save_chat(chat_id: str, title: str):
@@ -190,19 +262,6 @@ def get_messages(chat_id: str) -> List[ChatMessage]:
     
     return [ChatMessage(*row) for row in rows]
 
-def update_chat_title(chat_id: str, title: str):
-    """Update chat title"""
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    
-    cursor.execute(
-        "UPDATE chats SET title = ?, updated_at = ? WHERE id = ?",
-        (title, datetime.now().isoformat(), chat_id)
-    )
-    
-    conn.commit()
-    conn.close()
-
 async def save_report(query: str, report: str, chat_id: str) -> str:
     """Save report to disk and return the path"""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -220,7 +279,7 @@ async def save_report(query: str, report: str, chat_id: str) -> str:
     return str(filepath)
 
 async def handle_research_message(websocket: WebSocket, query: str, session: SessionState):
-    """Handle a research query"""
+    """Handle a research query with full streaming"""
     
     # Update session state
     session.current_query = query
@@ -253,48 +312,26 @@ async def handle_research_message(websocket: WebSocket, query: str, session: Ses
         "data": {"query": query}
     })
     
-    # Send and save initial message
-    initial_msg = "🔎 Starting research on your query..."
+    # Create streaming callback handler
+    callback_handler = StreamingCallbackHandler(websocket, session)
+    
+    # Start streaming message
     await websocket.send_json({
-        "type": "message",
-        "sender": "assistant",
-        "text": initial_msg
+        "type": "stream_start",
+        "sender": "assistant"
     })
-    save_message(session.chat_id, "assistant", initial_msg)
     
     try:
-        # Update progress - gathering information
-        await websocket.send_json({
-            "type": "event",
-            "event": "research_progress",
-            "data": {
-                "status": "Gathering information from various sources...",
-                "progress": 0.2
-            }
-        })
+        # Send initial message
+        await callback_handler.send_message(f"# 🔍 Research Query: {query}\n\n", "header")
+        await callback_handler.send_message("Starting deep research process...\n", "info")
         
-        gathering_msg = "📚 Gathering information from various sources..."
-        await websocket.send_json({
-            "type": "message",
-            "sender": "assistant",
-            "text": gathering_msg
-        })
-        save_message(session.chat_id, "assistant", gathering_msg)
-        
-        # Update progress - conducting research
-        await websocket.send_json({
-            "type": "event",
-            "event": "research_progress",
-            "data": {
-                "status": "Conducting deep research...",
-                "progress": 0.5
-            }
-        })
-        
-        # Run the deep researcher
-        result = await deep_researcher.ainvoke({
-            "messages": [HumanMessage(content=query)]
-        })
+        # Run the deep researcher with streaming
+        config = {"callbacks": [callback_handler]}
+        result = await deep_researcher.ainvoke(
+            {"messages": [HumanMessage(content=query)]},
+            config=config
+        )
         
         # Extract report and notes
         final_report = result.get("final_report", "No report generated")
@@ -309,11 +346,25 @@ async def handle_research_message(websocket: WebSocket, query: str, session: Ses
         # Save the report
         report_path = await save_report(query, final_report, session.chat_id)
         
-        # Save final report as assistant response
+        # Send final report with nice formatting
+        await callback_handler.send_message("\n---\n\n# 📊 Final Research Report\n\n", "report_header")
+        await callback_handler.send_message(final_report, "report_content")
+        
+        if report_path:
+            await callback_handler.send_message(f"\n\n📄 *Report saved to: {report_path}*", "report_saved")
+        
+        # End streaming
+        await websocket.send_json({
+            "type": "stream_end",
+            "sender": "assistant"
+        })
+        
+        # Save the complete interaction as assistant response
+        full_transcript = f"Research process completed. Final report:\n\n{final_report}"
         save_message(
             session.chat_id, 
             "assistant", 
-            final_report,
+            full_transcript,
             report_path=report_path
         )
         
@@ -327,41 +378,20 @@ async def handle_research_message(websocket: WebSocket, query: str, session: Ses
             }
         })
         
-        # Send final report
-        report_message = f"## Research Complete! 🎉\n\n{final_report}"
-        if report_path:
-            report_message += f"\n\n📄 *Report saved to: {report_path}*"
-        
-        await websocket.send_json({
-            "type": "message",
-            "sender": "assistant",
-            "text": report_message
-        })
-        
-        # Send updated state
-        await websocket.send_json({
-            "type": "state",
-            "data": {
-                "current_query": session.current_query,
-                "is_researching": session.is_researching,
-                "research_status": session.research_status,
-                "chat_id": session.chat_id,
-                "notes": session.notes,
-                "final_report": session.final_report
-            }
-        })
-        
     except Exception as e:
         session.is_researching = False
         session.research_status = f"Error: {str(e)}"
         
-        error_msg = f"❌ An error occurred during research: {str(e)}"
+        await callback_handler.send_message(f"\n❌ **Error:** {str(e)}\n", "error")
+        
+        # End streaming
         await websocket.send_json({
-            "type": "message",
-            "sender": "assistant",
-            "text": error_msg
+            "type": "stream_end",
+            "sender": "assistant"
         })
-        save_message(session.chat_id, "assistant", error_msg)
+        
+        # Save error message
+        save_message(session.chat_id, "assistant", f"Error during research: {str(e)}")
 
 # REST API endpoints
 @app.get("/api/chats")
@@ -401,7 +431,7 @@ async def create_chat(data: dict = {"title": "New Research"}):
 # WebSocket endpoint
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    """Handle WebSocket connections for AG-UI protocol"""
+    """Handle WebSocket connections for streaming research"""
     await websocket.accept()
     
     # Create session state for this connection

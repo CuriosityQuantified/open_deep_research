@@ -28,6 +28,7 @@ interface Message {
   content: string;
   timestamp: string;
   report_path?: string;
+  isStreaming?: boolean;
 }
 
 interface AGUIMessage {
@@ -36,6 +37,8 @@ interface AGUIMessage {
   sender?: string;
   event?: string;
   data?: any;
+  content?: string;
+  message_type?: string;
 }
 
 interface AGUIState {
@@ -62,6 +65,8 @@ const App: React.FC = () => {
     notes: [],
     final_report: ''
   });
+  const [streamingMessageId, setStreamingMessageId] = useState<string | null>(null);
+  const [streamBuffer, setStreamBuffer] = useState<string>('');
   
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
@@ -86,16 +91,53 @@ const App: React.FC = () => {
     const ws = new WebSocket('ws://localhost:8000/ws');
     
     ws.onopen = () => {
-      console.log('Connected to AG-UI server');
+      console.log('Connected to server');
       setIsLoading(false);
     };
     
     ws.onmessage = (event) => {
       const message: AGUIMessage = JSON.parse(event.data);
-      console.log('AG-UI message:', message);
+      console.log('Server message:', message);
       
-      if (message.type === 'message' && message.sender === 'assistant') {
-        // Add assistant message to UI only if it's for the current chat
+      if (message.type === 'stream_start') {
+        // Start a new streaming message
+        const newMessageId = Date.now().toString();
+        const newMessage: Message = {
+          id: newMessageId,
+          chat_id: agentState.chat_id || currentChatId || '',
+          role: 'assistant',
+          content: '',
+          timestamp: new Date().toISOString(),
+          isStreaming: true
+        };
+        setMessages(prev => [...prev, newMessage]);
+        setStreamingMessageId(newMessageId);
+        setStreamBuffer('');
+        setIsLoading(false);
+      } else if (message.type === 'stream' || message.type === 'token') {
+        // Append to streaming message
+        if (streamingMessageId) {
+          const content = message.content || '';
+          setStreamBuffer(prev => prev + content);
+          setMessages(prev => prev.map(msg => 
+            msg.id === streamingMessageId 
+              ? { ...msg, content: streamBuffer + content }
+              : msg
+          ));
+        }
+      } else if (message.type === 'stream_end') {
+        // End streaming
+        if (streamingMessageId) {
+          setMessages(prev => prev.map(msg => 
+            msg.id === streamingMessageId 
+              ? { ...msg, isStreaming: false }
+              : msg
+          ));
+          setStreamingMessageId(null);
+          setStreamBuffer('');
+        }
+      } else if (message.type === 'message' && message.sender === 'assistant') {
+        // Regular message (fallback)
         const chatId = agentState.chat_id || currentChatId || '';
         if (chatId && (chatId === currentChatId || !currentChatId)) {
           const newMessage: Message = {
@@ -116,10 +158,9 @@ const App: React.FC = () => {
           setIsLoading(false);
           // Reload messages to get the saved version
           if (currentChatId) {
-            loadMessages(currentChatId);
+            setTimeout(() => loadMessages(currentChatId), 1000);
           }
         } else if (message.event === 'research_progress') {
-          // Update progress (could add a progress bar)
           console.log('Progress:', message.data);
         }
       } else if (message.type === 'state') {
@@ -279,7 +320,7 @@ const App: React.FC = () => {
     };
     setMessages(prev => [...prev, tempUserMessage]);
 
-    // Send message via AG-UI WebSocket with chat_id
+    // Send message via WebSocket with chat_id
     sendMessageToAgent(userMessage, chatId);
   };
 
@@ -292,6 +333,39 @@ const App: React.FC = () => {
 
   const formatTimestamp = (timestamp: string) => {
     return format(new Date(timestamp), 'MMM d, yyyy h:mm a');
+  };
+
+  const renderMessageContent = (content: string) => {
+    return (
+      <ReactMarkdown
+        components={{
+          code: ({ inline, className, children, ...props }) => {
+            return !inline ? (
+              <pre className="bg-gray-900 text-gray-100 rounded-lg p-3 overflow-x-auto my-2">
+                <code className={className} {...props}>
+                  {children}
+                </code>
+              </pre>
+            ) : (
+              <code className="bg-gray-200 rounded px-1 py-0.5 font-mono text-sm" {...props}>
+                {children}
+              </code>
+            );
+          },
+          h1: ({ children }) => <h1 className="text-2xl font-bold mt-4 mb-2">{children}</h1>,
+          h2: ({ children }) => <h2 className="text-xl font-bold mt-3 mb-2">{children}</h2>,
+          h3: ({ children }) => <h3 className="text-lg font-bold mt-2 mb-1">{children}</h3>,
+          p: ({ children }) => <p className="mb-2">{children}</p>,
+          ul: ({ children }) => <ul className="list-disc list-inside mb-2">{children}</ul>,
+          ol: ({ children }) => <ol className="list-decimal list-inside mb-2">{children}</ol>,
+          blockquote: ({ children }) => (
+            <blockquote className="border-l-4 border-gray-300 pl-4 italic my-2">{children}</blockquote>
+          ),
+        }}
+      >
+        {content}
+      </ReactMarkdown>
+    );
   };
 
   return (
@@ -388,25 +462,11 @@ const App: React.FC = () => {
                       <p className="whitespace-pre-wrap">{message.content}</p>
                     ) : (
                       <div className="prose prose-sm max-w-none">
-                        <ReactMarkdown
-                          components={{
-                            code: ({ inline, className, children, ...props }) => {
-                              return !inline ? (
-                                <pre className="bg-gray-100 rounded-lg p-3 overflow-x-auto">
-                                  <code className={className} {...props}>
-                                    {children}
-                                  </code>
-                                </pre>
-                              ) : (
-                                <code className="bg-gray-100 rounded px-1 py-0.5" {...props}>
-                                  {children}
-                                </code>
-                              );
-                            }
-                          }}
-                        >
-                          {message.content}
-                        </ReactMarkdown>
+                        {renderMessageContent(message.content)}
+                        
+                        {message.isStreaming && (
+                          <span className="inline-block w-2 h-4 bg-gray-400 animate-pulse ml-1" />
+                        )}
                         
                         {message.report_path && (
                           <div className="mt-3 pt-3 border-t border-gray-200">
@@ -423,18 +483,20 @@ const App: React.FC = () => {
                       </div>
                     )}
                   </div>
-                  <div className="text-xs text-gray-500 mt-1">
-                    {formatTimestamp(message.timestamp)}
-                  </div>
+                  {!message.isStreaming && (
+                    <div className="text-xs text-gray-500 mt-1">
+                      {formatTimestamp(message.timestamp)}
+                    </div>
+                  )}
                 </div>
               ))}
               
-              {isLoading && (
+              {isLoading && !streamingMessageId && (
                 <div className="mb-6">
                   <div className="inline-block bg-white border border-gray-200 rounded-2xl p-4">
                     <div className="flex items-center gap-2">
                       <Loader2 size={20} className="animate-spin text-blue-600" />
-                      <span className="text-gray-600">Researching...</span>
+                      <span className="text-gray-600">Starting research...</span>
                     </div>
                   </div>
                 </div>
@@ -456,11 +518,11 @@ const App: React.FC = () => {
                 onKeyPress={handleKeyPress}
                 placeholder="Ask me anything for deep research..."
                 className="flex-1 resize-none rounded-lg border border-gray-300 px-4 py-3 focus:outline-none focus:ring-2 focus:ring-blue-500 min-h-[50px] max-h-[200px]"
-                disabled={isLoading}
+                disabled={isLoading || !!streamingMessageId}
               />
               <button
                 onClick={handleSendMessage}
-                disabled={!inputValue.trim() || isLoading}
+                disabled={!inputValue.trim() || isLoading || !!streamingMessageId}
                 className="px-4 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
               >
                 <Send size={20} />
